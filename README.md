@@ -8,6 +8,7 @@
 - 创建校验：拒绝**空配方**（422）、**未知批次**（400）、**非正整数份数**（422，含 0、负数、小数、字符串）
 - 新批次只能引用**已创建**的批次，引用关系天然构成有向无环图，不可能成环
 - 占比追溯：按每层“投入份数 / 该层总份数”递归分摊；同一原始样本经多条路径到达时**自动合并**；基于 `fractions.Fraction` 精确有理数运算，返回**约分后**的分子与分母
+- **配方变更影响预演**：提交完整替代配方，在内存中演算目标批次及全部下游批次各原始样本的原占比、预演占比与有符号差值，**不修改数据库**
 - 依赖安装与数据库建表全部纳入启动流程，无需手工初始化
 
 ## 快速开始（Docker）
@@ -47,6 +48,7 @@ docker compose up --build
 | `GET` | `/batches` | 列出全部批次 |
 | `GET` | `/batches/{id}` | 批次详情（混样含配方） |
 | `GET` | `/batches/{id}/composition` | 递归追溯原始样本占比 |
+| `POST` | `/batches/{id}/recipe-preview` | 配方变更影响预演（不写库） |
 
 ## 示例请求
 
@@ -113,6 +115,54 @@ curl http://localhost:8000/batches/4/composition
 
 S1 经两条路径进入 P2（直接投入 1/2，加上经 P1 的 1/2×1/2），合并为 3/4；各占比之和恒为 1。
 
+### 5. 预演 P1 配方变更的影响
+
+提交完整替代配方（沿用创建时的校验：严格正整数份数、重复原料合并、未知批次拒绝），在内存中把 P1 的配方替换为 `3×S1 + 1×S2`，返回 P1 及其全部下游批次（此处为 P2）各原始样本的原占比、预演占比与有符号差值（`delta = preview − original`），均为约分后的分子/分母：
+
+```bash
+curl -X POST http://localhost:8000/batches/3/recipe-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"recipe": [{"batch_id": 1, "portions": 3}, {"batch_id": 2, "portions": 1}]}'
+```
+
+```json
+{
+  "batch_id": 3,
+  "batch_name": "P1",
+  "recipe": [
+    {"batch_id": 1, "batch_name": "S1", "portions": 3},
+    {"batch_id": 2, "batch_name": "S2", "portions": 1}
+  ],
+  "affected_batches": [
+    {
+      "batch_id": 3,
+      "batch_name": "P1",
+      "kind": "pool",
+      "components": [
+        {"sample_id": 1, "sample_name": "S1", "original": {"numerator": 1, "denominator": 2}, "preview": {"numerator": 3, "denominator": 4}, "delta": {"numerator": 1, "denominator": 4}},
+        {"sample_id": 2, "sample_name": "S2", "original": {"numerator": 1, "denominator": 2}, "preview": {"numerator": 1, "denominator": 4}, "delta": {"numerator": -1, "denominator": 4}}
+      ]
+    },
+    {
+      "batch_id": 4,
+      "batch_name": "P2",
+      "kind": "pool",
+      "components": [
+        {"sample_id": 1, "sample_name": "S1", "original": {"numerator": 3, "denominator": 4}, "preview": {"numerator": 7, "denominator": 8}, "delta": {"numerator": 1, "denominator": 8}},
+        {"sample_id": 2, "sample_name": "S2", "original": {"numerator": 1, "denominator": 4}, "preview": {"numerator": 1, "denominator": 8}, "delta": {"numerator": -1, "denominator": 8}}
+      ]
+    }
+  ]
+}
+```
+
+说明：
+
+- 预演原料只能引用**比目标批次更早创建**的批次（含目标自身在内的引用都会被 400 拒绝），预演不会成环；
+- 多路径汇合的下游批次精确合并、只返回一次；未受影响的批次不出现在结果中；
+- 某样本在新配方下占比降为 0 时，以 `0/1` 返回，差值为负；
+- 预演**不修改数据库**：调用前后 `/batches/{id}` 与 `/batches/{id}/composition` 的结果保持原样。
+
 ### 错误示例
 
 ```bash
@@ -130,6 +180,11 @@ curl -X POST http://localhost:8000/pools -H 'Content-Type: application/json' \
 
 # 查询不存在的批次 → 404
 curl http://localhost:8000/batches/999/composition
+
+# 预演原料引用了比目标批次更晚创建的批次（或目标自身）→ 400
+curl -X POST http://localhost:8000/batches/3/recipe-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"recipe": [{"batch_id": 4, "portions": 1}]}'
 ```
 
 ## 占比计算说明
@@ -153,12 +208,12 @@ pytest                                 # 运行测试（使用临时数据库，
 
 ```
 app/
-  main.py       # FastAPI 路由与请求处理
+  main.py       # FastAPI 路由与请求处理（含配方变更预演端点）
   db.py         # SQLite 连接与建表（启动时自动执行）
   schemas.py    # Pydantic 请求/响应模型（含严格正整数校验）
-  service.py    # 递归占比计算（Fraction 精确分数）
+  service.py    # 递归占比计算与配方预演（Fraction 精确分数）
 tests/
-  test_api.py   # 端到端测试（含多级合并、约分、各类非法输入）
+  test_api.py   # 端到端测试（含多级合并、约分、配方预演、各类非法输入）
 Dockerfile
 docker-compose.yml
 requirements.txt
